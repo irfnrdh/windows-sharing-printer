@@ -159,7 +159,7 @@ function Show-Menu {
     Write-Host ""
     Write-Host "  ========================================" -ForegroundColor Cyan
     Write-Host "        SCHOOL PRINTER MANAGER"           -ForegroundColor Cyan
-    Write-Host "        Windows 10 Edition"               -ForegroundColor DarkCyan
+    Write-Host "        Windows 10 Edition by irfnrdh"               -ForegroundColor DarkCyan
     Write-Host "  ========================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  1. Share Printer (Server/Host)"
