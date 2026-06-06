@@ -1,403 +1,790 @@
-\\KEMBAR-PHOTO-PC-01-SERVER\F4_PANJANG
+# ================================================================
+#  printer-manager.ps1  |  School Printer Manager  |  Win10 Pro
+#  Untuk teknisi — setup lengkap SMB + sharing + diagnostik
+# ================================================================
 
+# ── Elevasi Admin ────────────────────────────────────────────────
+if (-not ([Security.Principal.WindowsPrincipal]
+          [Security.Principal.WindowsIdentity]::GetCurrent()
+         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
 
+    $scriptPath = if ($PSCommandPath) { $PSCommandPath }
+                  elseif ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path }
+                  else { $null }
 
-# ============================================================
-#  printer-manager.ps1
-#  School Printer Manager — Full Windows 10 Support
-#  Requires: Run as Administrator
-# ============================================================
-
-$ErrorActionPreference = "SilentlyContinue"
-
-# ── Auto-elevate jika belum Administrator ───────────────────
-function Assert-Admin {
-    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal] $identity
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Host ""
-        Write-Host "  [!] Script harus dijalankan sebagai Administrator." -ForegroundColor Yellow
-        Write-Host "      Mencoba elevasi otomatis..." -ForegroundColor Yellow
-        Start-Sleep -Seconds 1
-        $psargs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-        Start-Process powershell -Verb RunAs -ArgumentList $psargs
-        exit
+    if ($scriptPath) {
+        Start-Process powershell.exe `
+            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" `
+            -Verb RunAs
+    } else {
+        # Dipanggil dari pipe / ISE — minta user re-run manual
+        Write-Host "Jalankan script ini sebagai Administrator." -ForegroundColor Red
+        Read-Host "Tekan Enter untuk keluar"
     }
+    exit
 }
 
-Assert-Admin
+$ErrorActionPreference = "SilentlyContinue"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# ── Helper: warna output ────────────────────────────────────
-function Write-OK   { param($msg) Write-Host "  [OK] $msg" -ForegroundColor Green }
-function Write-Fail { param($msg) Write-Host "  [!]  $msg" -ForegroundColor Red   }
-function Write-Info { param($msg) Write-Host "  [i]  $msg" -ForegroundColor Cyan  }
-
-# ── Helper: pause tanpa error ────────────────────────────────
-function Pause-Screen {
+# ================================================================
+#  HELPER OUTPUT
+# ================================================================
+function OK   { param($m) Write-Host "  [OK]  $m" -ForegroundColor Green  }
+function FAIL { param($m) Write-Host "  [!]   $m" -ForegroundColor Red    }
+function INFO { param($m) Write-Host "  [i]   $m" -ForegroundColor Cyan   }
+function HEAD { param($m) Write-Host "`n  ── $m ──" -ForegroundColor Yellow }
+function LINE { Write-Host "  " + ("─" * 50) -ForegroundColor DarkGray }
+function WAIT {
     Write-Host ""
-    Write-Host "  Tekan Enter untuk kembali ke menu..." -ForegroundColor DarkGray -NoNewline
+    Write-Host "  Tekan Enter untuk lanjut..." -ForegroundColor DarkGray -NoNewline
     $null = Read-Host
 }
 
-# ── Helper: pilih printer dari daftar ───────────────────────
-# Return: objek printer, atau $null kalau gagal/batal
-function Select-Printer {
-    param([string]$Prompt = "Pilih nomor printer")
+# ================================================================
+#  HELPER: GET SERVICE STATUS
+# ================================================================
+function Get-SvcStatus { param($n)
+    $s = Get-Service $n 2>$null
+    if (-not $s) { return "Tidak ada" }
+    return $s.Status
+}
 
+# ================================================================
+#  HELPER: CEK FIREWALL RULE
+# ================================================================
+function Get-FWRuleStatus { param($group)
+    $rules = Get-NetFirewallRule 2>$null |
+             Where-Object { $_.DisplayGroup -like "*$group*" -and $_.Enabled -eq $true }
+    if ($rules) { return "Aktif" } else { return "Nonaktif" }
+}
+
+# ================================================================
+#  HELPER: PASSWORD PROTECTED SHARING STATUS
+# ================================================================
+function Get-PPSStatus {
+    try {
+        $val = Get-ItemProperty `
+            "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" `
+            -Name "restrictnullsessaccess" 2>$null
+        # Cara lain: cek via reg SmbServerConfiguration
+        $smb = Get-SmbServerConfiguration 2>$null
+        if ($smb) {
+            if ($smb.RequireSecuritySignature) { return "Aktif" }
+        }
+    } catch { }
+    # Cek registry sharing mode
+    $reg = Get-ItemProperty `
+        "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" `
+        -Name "everyoneincludesanonymous" 2>$null
+    return "Tidak diketahui"
+}
+
+# ================================================================
+#  A. SETUP SERVER — konfigurasi semua yang diperlukan di PC server
+# ================================================================
+function Setup-Server {
+    Clear-Host
+    Write-Host ""
+    Write-Host "  ╔══════════════════════════════════════════╗" -ForegroundColor Green
+    Write-Host "  ║       SETUP SERVER (PC yang punya        ║" -ForegroundColor Green
+    Write-Host "  ║       printer / host printer)            ║" -ForegroundColor Green
+    Write-Host "  ╚══════════════════════════════════════════╝" -ForegroundColor Green
+
+    HEAD "STEP 1 — Print Spooler"
+    $spooler = Get-Service -Name Spooler 2>$null
+    if ($spooler.Status -ne 'Running') {
+        Set-Service Spooler -StartupType Automatic
+        Start-Service Spooler
+        OK "Print Spooler dinyalakan & set Automatic"
+    } else {
+        OK "Print Spooler sudah Running"
+    }
+
+    HEAD "STEP 2 — Network Profile → Private"
+    $changed = 0
+    Get-NetConnectionProfile 2>$null |
+    Where-Object { $_.NetworkCategory -eq 'Public' } |
+    ForEach-Object {
+        Set-NetConnectionProfile -InterfaceIndex $_.InterfaceIndex -NetworkCategory Private
+        OK "[$($_.Name)] diubah Public → Private"
+        $changed++
+    }
+    if ($changed -eq 0) { OK "Semua profile sudah Private / Domain" }
+
+    HEAD "STEP 3 — Firewall: File & Printer Sharing"
+    netsh advfirewall firewall set rule group="File and Printer Sharing" new enable=Yes 2>$null | Out-Null
+    netsh advfirewall firewall set rule group="Network Discovery"         new enable=Yes 2>$null | Out-Null
+    OK "Firewall rules diaktifkan"
+
+    HEAD "STEP 4 — SMB Server (LanmanServer)"
+    Set-Service LanmanServer -StartupType Automatic 2>$null
+    Start-Service LanmanServer 2>$null
+    OK "SMB Server service: Running"
+
+    HEAD "STEP 5 — Matikan Password Protected Sharing"
+    # Supaya client tidak perlu login username/password server
+    try {
+        $netSharePath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+        Set-ItemProperty -Path $netSharePath -Name "everyoneincludesanonymous" -Value 1 -Force
+        Set-ItemProperty -Path $netSharePath -Name "restrictanonymous"         -Value 0 -Force
+
+        # Via PowerShell SMB config
+        Set-SmbServerConfiguration `
+            -RequireSecuritySignature $false `
+            -EnableSecuritySignature  $false `
+            -RestrictNullSessAccess   $false `
+            -Force 2>$null
+
+        # Via netsh
+        netsh advfirewall firewall set rule `
+            name="File and Printer Sharing (NB-Session-In)" new enable=Yes 2>$null | Out-Null
+
+        OK "Password Protected Sharing dinonaktifkan"
+        INFO "Client tidak perlu username/password untuk connect"
+    } catch {
+        FAIL "Gagal otomatis — lakukan manual:"
+        Write-Host "    Control Panel → Network → Advanced sharing settings"
+        Write-Host "    → Turn off password protected sharing"
+    }
+
+    HEAD "STEP 6 — Aktifkan Network Discovery di server"
+    netsh advfirewall firewall set rule group="Network Discovery" new enable=Yes 2>$null | Out-Null
+    OK "Network Discovery aktif"
+
+    HEAD "STEP 7 — Pilih & Share Printer"
     $printers = @(Get-Printer 2>$null)
-
     if ($printers.Count -eq 0) {
-        Write-Info "Tidak ada printer terpasang."
-        return $null
+        FAIL "Tidak ada printer terinstall. Install driver dulu."
+        WAIT; return
     }
 
     Write-Host ""
     for ($i = 0; $i -lt $printers.Count; $i++) {
-        $shared = if ($printers[$i].Shared)  { "[Shared]"  } else { "" }
-        $def    = if ($printers[$i].Default) { "[Default]" } else { "" }
-        Write-Host ("  {0,2}. {1} {2} {3}" -f ($i+1), $printers[$i].Name, $shared, $def)
+        $tag = if ($printers[$i].Shared) { "[Shared]" } else { "" }
+        Write-Host ("  {0,2}. {1} {2}" -f ($i+1), $printers[$i].Name, $tag)
     }
     Write-Host ""
+    $raw = Read-Host "  Pilih nomor printer (Enter = skip)"
+    if ($raw -match '^\d+$') {
+        $idx = [int]$raw - 1
+        if ($idx -ge 0 -and $idx -lt $printers.Count) {
+            $p = $printers[$idx]
+            $sn = Read-Host "  Nama Share (Enter = PRINTER_SEKOLAH)"
+            if ([string]::IsNullOrWhiteSpace($sn)) { $sn = "PRINTER_SEKOLAH" }
+            $sn = $sn -replace '[^\w\-]','_'
 
-    $raw = Read-Host $Prompt
-    if ($raw -notmatch '^\d+$') {
-        Write-Fail "Input tidak valid."
-        return $null
-    }
-    $idx = [int]$raw - 1
-    if ($idx -lt 0 -or $idx -ge $printers.Count) {
-        Write-Fail "Nomor di luar range."
-        return $null
-    }
-    return $printers[$idx]
-}
-
-# ── Helper: set default printer (Win10 compatible) ──────────
-function Set-DefaultPrinterWin10 {
-    param([string]$PrinterName)
-    # Metode 1: WScript.Network
-    try {
-        $net = New-Object -ComObject WScript.Network
-        $net.SetDefaultPrinter($PrinterName)
-        return $true
-    } catch { }
-    # Metode 2: Registry
-    try {
-        $reg = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows"
-        Set-ItemProperty -Path $reg -Name "Device" -Value "$PrinterName,winspool,Ne00:" -Force
-        return $true
-    } catch { }
-    return $false
-}
-
-# ── Helper: aktifkan firewall printer sharing ────────────────
-function Enable-PrinterFirewall {
-    netsh advfirewall firewall set rule group="File and Printer Sharing" new enable=Yes 2>$null | Out-Null
-    netsh advfirewall firewall set rule group="Printer Sharing"          new enable=Yes 2>$null | Out-Null
-}
-
-# ── Helper: network profile Public → Private ─────────────────
-function Set-NetworkProfilePrivate {
-    try {
-        $profiles = Get-NetConnectionProfile | Where-Object { $_.NetworkCategory -eq 'Public' }
-        foreach ($p in $profiles) {
-            Set-NetConnectionProfile -InterfaceIndex $p.InterfaceIndex -NetworkCategory Private
-            Write-Info "Network profile '$($p.Name)': Public → Private"
+            try {
+                Set-Printer -Name $p.Name -Shared $true -ShareName $sn -ErrorAction Stop
+                OK "Printer '$($p.Name)' di-share sebagai '$sn'"
+            } catch {
+                FAIL "Gagal share: $_"
+            }
         }
-    } catch { }
+    } else {
+        INFO "Skip — share printer bisa dilakukan di menu Share Printer"
+    }
+
+    HEAD "HASIL — Informasi untuk diberikan ke teknisi client"
+    Write-Host ""
+    Write-Host "  ┌─────────────────────────────────────────┐" -ForegroundColor Cyan
+    Write-Host "  │  INFORMASI SERVER (catat untuk client)  │" -ForegroundColor Cyan
+    Write-Host "  └─────────────────────────────────────────┘" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Nama Komputer  : " -NoNewline; Write-Host $env:COMPUTERNAME -ForegroundColor Yellow
+    Write-Host "  Workgroup      : " -NoNewline
+
+    $wg = (Get-WmiObject Win32_ComputerSystem 2>$null).Workgroup
+    Write-Host $wg -ForegroundColor Yellow
+
+    Write-Host ""
+    Get-NetIPAddress -AddressFamily IPv4 2>$null |
+    Where-Object { $_.IPAddress -notmatch '^127\.' -and $_.IPAddress -notmatch '^169\.' } |
+    ForEach-Object {
+        $a = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex 2>$null
+        $nm = if ($a) { $a.Name } else { "?" }
+        Write-Host ("  IP [{0}] : " -f $nm) -NoNewline
+        Write-Host $_.IPAddress -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    $shared = @(Get-Printer 2>$null | Where-Object { $_.Shared })
+    if ($shared.Count -gt 0) {
+        foreach ($sp in $shared) {
+            Write-Host "  Path Share     : " -NoNewline
+            Write-Host "\\$env:COMPUTERNAME\$($sp.ShareName)" -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host ""
+    WAIT
 }
 
-# ── Helper: connect printer (4 metode fallback) ──────────────
-function Connect-NetworkPrinter {
-    param([string]$UNC, [string]$Server)
-
-    # Metode 1: Add-Printer cmdlet
-    try { Add-Printer -ConnectionName $UNC -ErrorAction Stop; return $true } catch { }
-
-    # Metode 2: WScript.Network
-    try {
-        $net = New-Object -ComObject WScript.Network
-        $net.AddWindowsPrinterConnection($UNC)
-        return $true
-    } catch { }
-
-    # Metode 3: net use lalu Add-Printer
-    try {
-        net use "\\$Server" /persistent:no 2>$null | Out-Null
-        Add-Printer -ConnectionName $UNC -ErrorAction Stop
-        return $true
-    } catch { }
-
-    # Metode 4: rundll32 printui
-    try {
-        $p = Start-Process "rundll32.exe" -ArgumentList "printui.dll,PrintUIEntry /in /n `"$UNC`"" -Wait -PassThru
-        if ($p.ExitCode -eq 0) { return $true }
-    } catch { }
-
-    return $false
-}
-
-# ── Helper: simpan credentials ke Credential Manager ────────
-function Save-Credential {
-    param([string]$Server, [string]$User, [string]$Pass)
-    cmdkey /delete:"$Server"              2>$null | Out-Null
-    cmdkey /add:"$Server" /user:"$User" /pass:"$Pass" 2>$null | Out-Null
-}
-
-# ── Menu utama ───────────────────────────────────────────────
-function Show-Menu {
+# ================================================================
+#  B. SETUP CLIENT — konfigurasi semua yang diperlukan di PC client
+# ================================================================
+function Setup-Client {
     Clear-Host
     Write-Host ""
-    Write-Host "  ========================================" -ForegroundColor Cyan
-    Write-Host "        SCHOOL PRINTER MANAGER"            -ForegroundColor Cyan
-    Write-Host "        Windows 10 Edition"                -ForegroundColor DarkCyan
-    Write-Host "  ========================================" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "  1. Share Printer (Server/Host)"
-    Write-Host "  2. Connect Printer (Client)"
-    Write-Host "  3. List Semua Printer"
-    Write-Host "  4. Set Default Printer"
-    Write-Host "  5. Hapus Printer"
-    Write-Host "  6. Info IP Komputer Ini"
-    Write-Host "  0. Keluar"
-    Write-Host ""
-}
+    Write-Host "  ╔══════════════════════════════════════════╗" -ForegroundColor Magenta
+    Write-Host "  ║      SETUP CLIENT (PC yang mau pakai     ║" -ForegroundColor Magenta
+    Write-Host "  ║      printer lewat jaringan)             ║" -ForegroundColor Magenta
+    Write-Host "  ╚══════════════════════════════════════════╝" -ForegroundColor Magenta
 
-# ── Fungsi per menu (masing-masing fungsi, tidak pakai break) ─
-
-function Menu-SharePrinter {
-    $printer = Select-Printer "Pilih printer yang akan di-share"
-    if ($null -eq $printer) { Pause-Screen; return }
-
-    $shareName = Read-Host "Nama Share (kosongkan = PRINTER_SEKOLAH)"
-    if ([string]::IsNullOrWhiteSpace($shareName)) { $shareName = "PRINTER_SEKOLAH" }
-    $shareName = $shareName -replace '[^\w\-]', '_'
-
-    Enable-PrinterFirewall
-
-    # Pastikan Print Spooler jalan
-    $spooler = Get-Service -Name Spooler 2>$null
-    if ($spooler -and $spooler.Status -ne 'Running') {
-        Start-Service Spooler 2>$null
-        Write-Info "Print Spooler dinyalakan."
+    HEAD "STEP 1 — Network Profile → Private"
+    $changed = 0
+    Get-NetConnectionProfile 2>$null |
+    Where-Object { $_.NetworkCategory -eq 'Public' } |
+    ForEach-Object {
+        Set-NetConnectionProfile -InterfaceIndex $_.InterfaceIndex -NetworkCategory Private
+        OK "[$($_.Name)] Public → Private"
+        $changed++
     }
+    if ($changed -eq 0) { OK "Semua profile sudah Private" }
 
-    # Set network profile ke Private supaya sharing aktif
-    Set-NetworkProfilePrivate
+    HEAD "STEP 2 — Firewall: File & Printer Sharing (client)"
+    netsh advfirewall firewall set rule group="File and Printer Sharing" new enable=Yes 2>$null | Out-Null
+    netsh advfirewall firewall set rule group="Network Discovery"         new enable=Yes 2>$null | Out-Null
+    OK "Firewall rules diaktifkan"
 
-    $ok = $false
+    HEAD "STEP 3 — SMB Client (LanmanWorkstation)"
+    Set-Service LanmanWorkstation -StartupType Automatic 2>$null
+    Start-Service LanmanWorkstation 2>$null
+    OK "SMB Client service: Running"
+
+    HEAD "STEP 4 — SMB2 protokol (wajib Win10)"
     try {
-        Set-Printer -Name $printer.Name -Shared $true -ShareName $shareName -ErrorAction Stop
-        $ok = $true
-    } catch {
-        Write-Fail "Gagal share printer: $_"
-    }
+        Set-SmbClientConfiguration -EnableMultichannel $true -Force 2>$null
+        OK "SMB Client dikonfigurasi"
+    } catch { INFO "Skip konfigurasi SMB client (tidak kritis)" }
 
-    if ($ok) {
-        Write-Host ""
-        Write-OK "Printer berhasil di-share!"
-        Write-Host ""
-        Write-Host "  Path jaringan : " -NoNewline
-        Write-Host "\\$env:COMPUTERNAME\$shareName" -ForegroundColor Yellow
-        Write-Host ""
-        $ips = @(Get-NetIPAddress -AddressFamily IPv4 2>$null |
-                 Where-Object { $_.IPAddress -notmatch '^127\.' } |
-                 Select-Object -ExpandProperty IPAddress)
-        if ($ips.Count -gt 0) {
-            Write-Host "  IP Server     : " -NoNewline
-            Write-Host ($ips -join ", ") -ForegroundColor Yellow
-        }
-        Write-Info "Berikan IP di atas ke komputer client."
-    }
-
-    Pause-Screen
-}
-
-function Menu-ConnectPrinter {
+    HEAD "STEP 5 — Input data server"
     Write-Host ""
-    $server = Read-Host "  IP atau Nama Server (contoh: 192.168.1.10)"
+    $server = Read-Host "  IP Server (contoh: 192.168.1.10)"
     $share  = Read-Host "  Nama Share (contoh: PRINTER_SEKOLAH)"
 
     if ([string]::IsNullOrWhiteSpace($server) -or [string]::IsNullOrWhiteSpace($share)) {
-        Write-Fail "Server dan nama share tidak boleh kosong."
-        Pause-Screen; return
+        FAIL "IP dan nama share wajib diisi."; WAIT; return
     }
 
     $unc = "\\$server\$share"
 
-    Write-Info "[1/5] Mengaktifkan firewall client..."
-    Enable-PrinterFirewall
-
-    Write-Info "[2/5] Set network profile ke Private..."
-    Set-NetworkProfilePrivate
-
-    Write-Info "[3/5] Mengaktifkan SMB client..."
-    sc.exe config lanmanworkstation start= auto 2>$null | Out-Null
-    Start-Service lanmanworkstation 2>$null
-
-    Write-Info "[4/5] Ping ke $server ..."
-    $ping = Test-Connection -ComputerName $server -Count 1 -Quiet 2>$null
-    if (-not $ping) {
-        Write-Fail "Server tidak merespons ping."
-        Write-Host "  (Bisa jadi firewall server blokir ICMP — tetap lanjut coba)" -ForegroundColor DarkYellow
+    HEAD "STEP 6 — Test koneksi ke server"
+    Write-Host ""
+    Write-Host "  Ping $server ..." -NoNewline
+    $ping = Test-Connection -ComputerName $server -Count 2 -Quiet 2>$null
+    if ($ping) {
+        Write-Host " OK" -ForegroundColor Green
+    } else {
+        Write-Host " GAGAL" -ForegroundColor Red
+        FAIL "Server tidak merespons. Cek:"
+        Write-Host "    - Kabel/WiFi tersambung ke jaringan yang sama"
+        Write-Host "    - IP server benar"
+        Write-Host "    - Server menyala"
+        $lanjut = Read-Host "`n  Tetap lanjut? (y/N)"
+        if ($lanjut -notmatch '^[yY]$') { WAIT; return }
     }
 
-    Write-Info "[5/5] Cek akses $unc ..."
-    $reachable = Test-Path $unc 2>$null
-
-    if (-not $reachable) {
+    HEAD "STEP 7 — Test akses path jaringan"
+    Write-Host "  Akses $unc ..." -NoNewline
+    $reach = Test-Path $unc 2>$null
+    if (-not $reach) {
+        Write-Host " GAGAL" -ForegroundColor Red
         Write-Host ""
-        Write-Fail "Path $unc tidak bisa diakses."
+        Write-Host "  Path tidak bisa diakses. Pilihan:" -ForegroundColor Yellow
+        Write-Host "    [1] Coba dengan username/password server"
+        Write-Host "    [2] Batal"
         Write-Host ""
-        Write-Host "  Kemungkinan penyebab:" -ForegroundColor Yellow
-        Write-Host "    [A] Password Protected Sharing aktif di server"
-        Write-Host "    [B] Nama share salah (cek di server: Menu 1)"
-        Write-Host "    [C] Firewall server blokir port 445"
-        Write-Host ""
-
-        $tryAuth = Read-Host "  Coba login dengan username/password server? (y/N)"
-        if ($tryAuth -match '^[yY]$') {
-            $user = Read-Host "  Username (contoh: Administrator)"
+        $opt = Read-Host "  Pilih"
+        if ($opt -eq "1") {
+            $user    = Read-Host "  Username server"
             $secPass = Read-Host "  Password" -AsSecureString
-            $plainPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass)
-            )
-            Save-Credential -Server $server -User $user -Pass $plainPass
+            $plainP  = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                           [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass))
 
-            Write-Info "Autentikasi ke \\$server ..."
-            net use "\\$server" /user:"$user" "$plainPass" /persistent:no 2>&1 | Out-Null
+            cmdkey /delete:"$server" 2>$null | Out-Null
+            cmdkey /add:"$server" /user:"$user" /pass:"$plainP" 2>$null | Out-Null
+            net use "\\$server" /user:"$user" "$plainP" /persistent:yes 2>&1 | Out-Null
 
-            $reachable = Test-Path $unc 2>$null
-            if (-not $reachable) {
-                Write-Fail "Masih tidak bisa akses setelah login."
-                Write-Info "Cek nama share dan pastikan Password Protected Sharing dimatikan di server."
-                Pause-Screen; return
+            $reach = Test-Path $unc 2>$null
+            if (-not $reach) {
+                FAIL "Masih gagal. Kemungkinan nama share salah atau firewall server."
+                WAIT; return
             }
-            Write-OK "Autentikasi berhasil."
+            OK "Autentikasi berhasil"
         } else {
-            Pause-Screen; return
+            WAIT; return
         }
-    }
-
-    Write-Host ""
-    Write-Info "Menambahkan printer..."
-    if (Connect-NetworkPrinter -UNC $unc -Server $server) {
-        Write-Host ""
-        Write-OK "Printer berhasil ditambahkan!"
-        Write-Info "Cek di: Settings > Printers & scanners"
     } else {
-        Write-Host ""
-        Write-Fail "Gagal otomatis. Coba manual:"
-        Write-Host "    1. Buka File Explorer"
-        Write-Host "    2. Address bar ketik: \\$server"
-        Write-Host "    3. Double-click printer '$share'"
+        Write-Host " OK" -ForegroundColor Green
     }
 
-    Pause-Screen
-}
+    HEAD "STEP 8 — Install printer"
+    Write-Host "  Menambahkan printer $unc ..."
+    $added = $false
 
-function Menu-ListPrinter {
-    Write-Host ""
-    $printers = @(Get-Printer 2>$null)
-    if ($printers.Count -eq 0) {
-        Write-Info "Tidak ada printer terpasang."
-    } else {
-        $printers | Format-Table `
-            @{L="No"          ; E={ [array]::IndexOf($printers,$_)+1 }; W=4  },
-            @{L="Nama Printer"; E={ $_.Name }                          ; W=40 },
-            @{L="Shared"      ; E={ $_.Shared }                        ; W=8  },
-            @{L="Default"     ; E={ $_.Default }                       ; W=8  },
-            @{L="Status"      ; E={ $_.PrinterStatus }                 ; W=12 } `
-            -AutoSize
-    }
-    Pause-Screen
-}
+    # Metode 1
+    try { Add-Printer -ConnectionName $unc -ErrorAction Stop; $added = $true } catch { }
 
-function Menu-SetDefault {
-    $printer = Select-Printer "Pilih printer yang dijadikan default"
-    if ($null -eq $printer) { Pause-Screen; return }
-
-    # Matikan "Let Windows manage default printer"
-    try {
-        $reg = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows"
-        Set-ItemProperty -Path $reg -Name "LegacyDefaultPrinterMode" -Value 1 -Type DWord -Force
-    } catch { }
-
-    if (Set-DefaultPrinterWin10 -PrinterName $printer.Name) {
-        Write-OK "Default printer: $($printer.Name)"
-    } else {
-        Write-Fail "Gagal. Ubah manual: Settings > Printers & scanners"
-    }
-    Pause-Screen
-}
-
-function Menu-HapusPrinter {
-    $printer = Select-Printer "Pilih printer yang akan dihapus"
-    if ($null -eq $printer) { Pause-Screen; return }
-
-    Write-Host ""
-    $confirm = Read-Host "  Yakin hapus '$($printer.Name)'? (y/N)"
-    if ($confirm -notmatch '^[yY]$') {
-        Write-Info "Dibatalkan."
-        Pause-Screen; return
-    }
-
-    $removed = $false
-    try {
-        Remove-Printer -Name $printer.Name -ErrorAction Stop
-        $removed = $true
-    } catch { }
-
-    if (-not $removed) {
+    # Metode 2
+    if (-not $added) {
         try {
-            Start-Process "rundll32.exe" `
-                -ArgumentList "printui.dll,PrintUIEntry /dl /n `"$($printer.Name)`"" -Wait
-            $removed = $true
+            $net = New-Object -ComObject WScript.Network
+            $net.AddWindowsPrinterConnection($unc)
+            $added = $true
         } catch { }
     }
 
-    if ($removed) { Write-OK "Printer '$($printer.Name)' dihapus." }
-    else          { Write-Fail "Gagal menghapus printer." }
+    # Metode 3
+    if (-not $added) {
+        try {
+            net use "\\$server" /persistent:no 2>$null | Out-Null
+            Add-Printer -ConnectionName $unc -ErrorAction Stop
+            $added = $true
+        } catch { }
+    }
 
-    Pause-Screen
+    # Metode 4
+    if (-not $added) {
+        try {
+            $p = Start-Process "rundll32.exe" `
+                -ArgumentList "printui.dll,PrintUIEntry /in /n `"$unc`"" `
+                -Wait -PassThru
+            if ($p.ExitCode -eq 0) { $added = $true }
+        } catch { }
+    }
+
+    Write-Host ""
+    if ($added) {
+        OK "Printer berhasil ditambahkan: $unc"
+        INFO "Cek: Settings > Printers & scanners"
+    } else {
+        FAIL "Gagal otomatis. Lakukan manual:"
+        Write-Host "    1. File Explorer → address bar ketik: \\$server"
+        Write-Host "    2. Double-click ikon printer '$share'"
+        Write-Host "    3. Windows akan install driver dari server"
+        Write-Host ""
+        INFO "Atau: Jika driver tidak ada di server, install driver"
+        INFO "Epson L3210 di client dulu, baru ulangi langkah ini."
+    }
+
+    WAIT
 }
 
-function Menu-InfoIP {
+# ================================================================
+#  C. SHARE PRINTER (cepat, tanpa full setup)
+# ================================================================
+function Share-Printer {
+    Clear-Host
+    HEAD "SHARE PRINTER"
+
+    $printers = @(Get-Printer 2>$null)
+    if ($printers.Count -eq 0) { FAIL "Tidak ada printer."; WAIT; return }
+
     Write-Host ""
-    Write-Host "  Nama Komputer : $env:COMPUTERNAME" -ForegroundColor Cyan
-    Write-Host ""
-    try {
-        Get-NetIPAddress -AddressFamily IPv4 |
-        Where-Object { $_.IPAddress -notmatch '^127\.' } |
-        ForEach-Object {
-            $adapter = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex 2>$null
-            $nama = if ($adapter) { $adapter.Name } else { "?" }
-            Write-Host ("  [{0}]  {1}" -f $nama, $_.IPAddress) -ForegroundColor Yellow
-        }
-    } catch {
-        ipconfig 2>$null | Select-String "IPv4"
+    for ($i = 0; $i -lt $printers.Count; $i++) {
+        $tag = if ($printers[$i].Shared) { "[Shared]" } else { "" }
+        Write-Host ("  {0,2}. {1} {2}" -f ($i+1), $printers[$i].Name, $tag)
     }
     Write-Host ""
-    Write-Info "Gunakan IP ini saat client connect."
-    Pause-Screen
+    $raw = Read-Host "  Pilih nomor"
+    if ($raw -notmatch '^\d+$') { FAIL "Input tidak valid."; WAIT; return }
+
+    $idx = [int]$raw - 1
+    if ($idx -lt 0 -or $idx -ge $printers.Count) { FAIL "Nomor di luar range."; WAIT; return }
+
+    $p  = $printers[$idx]
+    $sn = Read-Host "  Nama Share (Enter = PRINTER_SEKOLAH)"
+    if ([string]::IsNullOrWhiteSpace($sn)) { $sn = "PRINTER_SEKOLAH" }
+    $sn = $sn -replace '[^\w\-]','_'
+
+    netsh advfirewall firewall set rule group="File and Printer Sharing" new enable=Yes 2>$null | Out-Null
+
+    try {
+        Set-Printer -Name $p.Name -Shared $true -ShareName $sn -ErrorAction Stop
+        Write-Host ""
+        OK "Berhasil di-share!"
+        Write-Host "  Path : " -NoNewline; Write-Host "\\$env:COMPUTERNAME\$sn" -ForegroundColor Yellow
+
+        $ips = @(Get-NetIPAddress -AddressFamily IPv4 2>$null |
+                 Where-Object { $_.IPAddress -notmatch '^127\.' -and $_.IPAddress -notmatch '^169\.' } |
+                 Select-Object -ExpandProperty IPAddress)
+        Write-Host "  IP   : " -NoNewline; Write-Host ($ips -join "  |  ") -ForegroundColor Yellow
+    } catch {
+        FAIL "Gagal: $_"
+    }
+    WAIT
 }
 
-# ── Loop utama — TANPA break di dalam switch ─────────────────
-$running = $true
+# ================================================================
+#  D. CONNECT PRINTER (cepat, tanpa full setup)
+# ================================================================
+function Connect-Printer-Quick {
+    Clear-Host
+    HEAD "CONNECT PRINTER"
+    Write-Host ""
+    $server = Read-Host "  IP Server"
+    $share  = Read-Host "  Nama Share"
+    if ([string]::IsNullOrWhiteSpace($server) -or [string]::IsNullOrWhiteSpace($share)) {
+        FAIL "Tidak boleh kosong."; WAIT; return
+    }
 
+    $unc = "\\$server\$share"
+    Write-Host ""
+    Write-Host "  Menambahkan $unc ..." -NoNewline
+
+    $added = $false
+    try { Add-Printer -ConnectionName $unc -ErrorAction Stop; $added = $true } catch { }
+    if (-not $added) {
+        try {
+            $net = New-Object -ComObject WScript.Network
+            $net.AddWindowsPrinterConnection($unc); $added = $true
+        } catch { }
+    }
+    if (-not $added) {
+        $p = Start-Process "rundll32.exe" `
+            -ArgumentList "printui.dll,PrintUIEntry /in /n `"$unc`"" -Wait -PassThru 2>$null
+        if ($p -and $p.ExitCode -eq 0) { $added = $true }
+    }
+
+    if ($added) { Write-Host " OK" -ForegroundColor Green; OK "Printer ditambahkan." }
+    else        { Write-Host " GAGAL" -ForegroundColor Red; FAIL "Jalankan Setup Client (Menu 2) untuk troubleshooting lengkap." }
+    WAIT
+}
+
+# ================================================================
+#  E. LIST PRINTER
+# ================================================================
+function List-Printers {
+    Clear-Host
+    HEAD "DAFTAR PRINTER"
+    Write-Host ""
+    $printers = @(Get-Printer 2>$null)
+    if ($printers.Count -eq 0) { INFO "Tidak ada printer."; WAIT; return }
+    $printers | Format-Table `
+        @{L="No"      ; E={ [array]::IndexOf($printers,$_)+1 }; W=4  },
+        @{L="Nama"    ; E={ $_.Name }                          ; W=38 },
+        @{L="Shared"  ; E={ $_.Shared }                        ; W=7  },
+        @{L="Default" ; E={ $_.Default }                       ; W=8  },
+        @{L="Type"    ; E={ $_.Type }                          ; W=8  },
+        @{L="Status"  ; E={ $_.PrinterStatus }                 ; W=10 } `
+        -AutoSize
+    WAIT
+}
+
+# ================================================================
+#  F. SET DEFAULT PRINTER
+# ================================================================
+function Set-Default-Printer {
+    Clear-Host
+    HEAD "SET DEFAULT PRINTER"
+    $printers = @(Get-Printer 2>$null)
+    if ($printers.Count -eq 0) { FAIL "Tidak ada printer."; WAIT; return }
+    Write-Host ""
+    for ($i=0; $i -lt $printers.Count; $i++) {
+        Write-Host ("  {0,2}. {1}" -f ($i+1), $printers[$i].Name)
+    }
+    Write-Host ""
+    $raw = Read-Host "  Pilih nomor"
+    if ($raw -notmatch '^\d+$') { FAIL "Input tidak valid."; WAIT; return }
+    $idx = [int]$raw - 1
+    if ($idx -lt 0 -or $idx -ge $printers.Count) { FAIL "Di luar range."; WAIT; return }
+
+    # Matikan "Let Windows manage default printer"
+    Set-ItemProperty `
+        "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows" `
+        -Name "LegacyDefaultPrinterMode" -Value 1 -Type DWord -Force 2>$null
+
+    $ok = $false
+    try {
+        $net = New-Object -ComObject WScript.Network
+        $net.SetDefaultPrinter($printers[$idx].Name)
+        $ok = $true
+    } catch { }
+    if (-not $ok) {
+        Set-ItemProperty `
+            "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows" `
+            -Name "Device" -Value "$($printers[$idx].Name),winspool,Ne00:" -Force 2>$null
+        $ok = $true
+    }
+
+    if ($ok) { OK "Default: $($printers[$idx].Name)" }
+    else     { FAIL "Gagal." }
+    WAIT
+}
+
+# ================================================================
+#  G. HAPUS PRINTER
+# ================================================================
+function Remove-Printer-Menu {
+    Clear-Host
+    HEAD "HAPUS PRINTER"
+    $printers = @(Get-Printer 2>$null)
+    if ($printers.Count -eq 0) { INFO "Tidak ada printer."; WAIT; return }
+    Write-Host ""
+    for ($i=0; $i -lt $printers.Count; $i++) {
+        Write-Host ("  {0,2}. {1}" -f ($i+1), $printers[$i].Name)
+    }
+    Write-Host ""
+    $raw = Read-Host "  Pilih nomor"
+    if ($raw -notmatch '^\d+$') { FAIL "Input tidak valid."; WAIT; return }
+    $idx = [int]$raw - 1
+    if ($idx -lt 0 -or $idx -ge $printers.Count) { FAIL "Di luar range."; WAIT; return }
+
+    $nama = $printers[$idx].Name
+    $confirm = Read-Host "  Hapus '$nama'? (y/N)"
+    if ($confirm -notmatch '^[yY]$') { INFO "Dibatalkan."; WAIT; return }
+
+    $ok = $false
+    try { Remove-Printer -Name $nama -ErrorAction Stop; $ok = $true } catch { }
+    if (-not $ok) {
+        Start-Process "rundll32.exe" `
+            -ArgumentList "printui.dll,PrintUIEntry /dl /n `"$nama`"" -Wait 2>$null
+        $ok = $true
+    }
+    if ($ok) { OK "Printer '$nama' dihapus." } else { FAIL "Gagal." }
+    WAIT
+}
+
+# ================================================================
+#  H. DIAGNOSTIK LENGKAP (untuk teknisi)
+# ================================================================
+function Run-Diagnostics {
+    Clear-Host
+    Write-Host ""
+    Write-Host "  ╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "  ║          LAPORAN DIAGNOSTIK TEKNISI              ║" -ForegroundColor Cyan
+    Write-Host "  ║  $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')                          ║" -ForegroundColor Cyan
+    Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+
+    # ── IDENTITAS KOMPUTER ──────────────────────────────────────
+    HEAD "IDENTITAS KOMPUTER"
+    $cs = Get-WmiObject Win32_ComputerSystem 2>$null
+    $os = Get-WmiObject Win32_OperatingSystem 2>$null
+    Write-Host ""
+    Write-Host "  Nama Komputer   : " -NoNewline; Write-Host $env:COMPUTERNAME         -ForegroundColor Yellow
+    Write-Host "  Workgroup/Domain: " -NoNewline; Write-Host $cs.Workgroup              -ForegroundColor Yellow
+    Write-Host "  Login sebagai   : " -NoNewline; Write-Host $env:USERNAME              -ForegroundColor Yellow
+    Write-Host "  OS              : " -NoNewline; Write-Host $os.Caption                -ForegroundColor Yellow
+    Write-Host "  OS Build        : " -NoNewline; Write-Host $os.BuildNumber            -ForegroundColor Yellow
+    Write-Host "  OS Arch         : " -NoNewline; Write-Host $os.OSArchitecture         -ForegroundColor Yellow
+    Write-Host "  RAM             : " -NoNewline
+    Write-Host ("{0:N1} GB" -f ($cs.TotalPhysicalMemory / 1GB))                        -ForegroundColor Yellow
+
+    # ── NETWORK ADAPTERS DETAIL ─────────────────────────────────
+    HEAD "NETWORK ADAPTERS (semua)"
+    Write-Host ""
+    $adapters = Get-NetAdapter 2>$null | Where-Object { $_.Status -eq 'Up' }
+    foreach ($a in $adapters) {
+        $ipInfo = Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 2>$null |
+                  Where-Object { $_.IPAddress -notmatch '^127\.' }
+        $gw     = (Get-NetRoute -InterfaceIndex $a.ifIndex -DestinationPrefix "0.0.0.0/0" 2>$null |
+                   Select-Object -First 1).NextHop
+        $dns    = (Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 2>$null).ServerAddresses
+
+        Write-Host "  ┌── Adapter    : " -NoNewline; Write-Host $a.Name              -ForegroundColor Yellow
+        Write-Host "  │   Deskripsi  : $($a.InterfaceDescription)"
+        Write-Host "  │   MAC Address: " -NoNewline; Write-Host $a.MacAddress        -ForegroundColor Yellow
+        Write-Host "  │   Link Speed : $($a.LinkSpeed)"
+
+        if ($ipInfo) {
+            Write-Host "  │   IP Address : " -NoNewline; Write-Host $ipInfo.IPAddress      -ForegroundColor Green
+            Write-Host "  │   Prefix Len : /$($ipInfo.PrefixLength)"
+
+            # Hitung subnet mask dari prefix length
+            $pl = $ipInfo.PrefixLength
+            if ($pl) {
+                $mask = [Convert]::ToUInt32(('1' * $pl + '0' * (32-$pl)), 2)
+                $bytes = [BitConverter]::GetBytes($mask)
+                [Array]::Reverse($bytes)
+                $subnetMask = $bytes -join '.'
+                Write-Host "  │   Subnet Mask: $subnetMask"
+            }
+        } else {
+            Write-Host "  │   IP Address : (tidak ada)"
+        }
+
+        Write-Host "  │   Gateway    : " -NoNewline
+        if ($gw) { Write-Host $gw -ForegroundColor Cyan } else { Write-Host "-" }
+        Write-Host "  │   DNS Server : " -NoNewline
+        if ($dns) { Write-Host ($dns -join ", ") -ForegroundColor Cyan } else { Write-Host "-" }
+
+        $profile = (Get-NetConnectionProfile -InterfaceIndex $a.ifIndex 2>$null).NetworkCategory
+        $col = if ($profile -eq 'Private') { 'Green' } else { 'Red' }
+        Write-Host "  └── Net Profile : " -NoNewline; Write-Host $profile -ForegroundColor $col
+        Write-Host ""
+    }
+
+    $downAdapters = Get-NetAdapter 2>$null | Where-Object { $_.Status -ne 'Up' }
+    foreach ($a in $downAdapters) {
+        Write-Host "  [DOWN] $($a.Name) — $($a.InterfaceDescription)" -ForegroundColor DarkGray
+    }
+
+    # ── SERVICES STATUS ─────────────────────────────────────────
+    HEAD "STATUS SERVICES PENTING"
+    Write-Host ""
+    $services = @(
+        @{ Name="Spooler";           Label="Print Spooler         " },
+        @{ Name="LanmanServer";      Label="SMB Server            " },
+        @{ Name="LanmanWorkstation"; Label="SMB Client (Workstatn)" },
+        @{ Name="Browser";           Label="Computer Browser      " },
+        @{ Name="lmhosts";           Label="TCP/IP NetBIOS Helper " },
+        @{ Name="Netlogon";          Label="Net Logon             " }
+    )
+    foreach ($svc in $services) {
+        $s   = Get-Service $svc.Name 2>$null
+        $st  = if ($s) { $s.Status } else { "Tidak ada" }
+        $col = if ($st -eq 'Running') { 'Green' } elseif ($st -eq 'Stopped') { 'Red' } else { 'DarkGray' }
+        Write-Host ("  {0}: " -f $svc.Label) -NoNewline
+        Write-Host $st -ForegroundColor $col
+    }
+
+    # ── FIREWALL STATUS ─────────────────────────────────────────
+    HEAD "FIREWALL"
+    Write-Host ""
+    $fwProfiles = Get-NetFirewallProfile 2>$null
+    foreach ($fp in $fwProfiles) {
+        $col = if ($fp.Enabled) { 'Yellow' } else { 'DarkGray' }
+        Write-Host ("  Profile [{0,-9}]: Firewall " -f $fp.Name) -NoNewline
+        Write-Host (if ($fp.Enabled) { "ON" } else { "OFF" }) -ForegroundColor $col
+    }
+    Write-Host ""
+    $fwGroups = @("File and Printer Sharing","Network Discovery","Printer Sharing")
+    foreach ($g in $fwGroups) {
+        $rules = @(Get-NetFirewallRule 2>$null |
+                   Where-Object { $_.DisplayGroup -like "*$g*" -and $_.Enabled -eq $true })
+        $st  = if ($rules.Count -gt 0) { "Aktif ($($rules.Count) rules)" } else { "NONAKTIF" }
+        $col = if ($rules.Count -gt 0) { 'Green' } else { 'Red' }
+        Write-Host ("  {0,-30}: " -f $g) -NoNewline
+        Write-Host $st -ForegroundColor $col
+    }
+
+    # ── SMB KONFIGURASI ─────────────────────────────────────────
+    HEAD "SMB KONFIGURASI"
+    Write-Host ""
+    $smbSrv = Get-SmbServerConfiguration 2>$null
+    $smbCli = Get-SmbClientConfiguration 2>$null
+    if ($smbSrv) {
+        Write-Host "  SMB1 Server Enabled    : " -NoNewline
+        $col = if ($smbSrv.EnableSMB1Protocol) { 'Yellow' } else { 'Green' }
+        Write-Host $smbSrv.EnableSMB1Protocol -ForegroundColor $col
+        Write-Host "  SMB2 Server Enabled    : " -NoNewline
+        Write-Host $smbSrv.EnableSMB2Protocol -ForegroundColor Green
+        Write-Host "  Require Security Sign  : $($smbSrv.RequireSecuritySignature)"
+        Write-Host "  AutoDisconnect (menit) : $($smbSrv.AutoDisconnectTimeout)"
+    }
+    if ($smbCli) {
+        Write-Host "  SMB1 Client Enabled    : " -NoNewline
+        $col = if ($smbCli.EnableSMB1Protocol) { 'Yellow' } else { 'Green' }
+        Write-Host $smbCli.EnableSMB1Protocol -ForegroundColor $col
+    }
+
+    # ── PRINTER DETAIL ──────────────────────────────────────────
+    HEAD "PRINTER TERINSTALL"
+    Write-Host ""
+    $printers = @(Get-Printer 2>$null)
+    if ($printers.Count -eq 0) {
+        Write-Host "  (tidak ada printer)" -ForegroundColor DarkGray
+    } else {
+        foreach ($p in $printers) {
+            $col = if ($p.PrinterStatus -eq 'Normal') { 'Green' } else { 'Red' }
+            Write-Host "  ┌── Nama      : " -NoNewline; Write-Host $p.Name           -ForegroundColor Yellow
+            Write-Host "  │   Driver    : $($p.DriverName)"
+            Write-Host "  │   Port      : $($p.PortName)"
+            Write-Host "  │   Shared    : " -NoNewline
+            if ($p.Shared) {
+                Write-Host "Ya  →  \\$env:COMPUTERNAME\$($p.ShareName)" -ForegroundColor Green
+            } else {
+                Write-Host "Tidak" -ForegroundColor DarkGray
+            }
+            Write-Host "  │   Default   : $($p.Default)"
+            Write-Host "  └── Status    : " -NoNewline; Write-Host $p.PrinterStatus  -ForegroundColor $col
+            Write-Host ""
+        }
+    }
+
+    # ── PING TEST ───────────────────────────────────────────────
+    HEAD "PING TEST GATEWAY"
+    Write-Host ""
+    $gws = Get-NetRoute -DestinationPrefix "0.0.0.0/0" 2>$null |
+           Where-Object { $_.NextHop -ne '0.0.0.0' } |
+           Select-Object -ExpandProperty NextHop -Unique
+    foreach ($gw in $gws) {
+        Write-Host "  Ping $gw ... " -NoNewline
+        $ok = Test-Connection -ComputerName $gw -Count 1 -Quiet 2>$null
+        if ($ok) { Write-Host "OK" -ForegroundColor Green }
+        else     { Write-Host "GAGAL" -ForegroundColor Red }
+    }
+
+    # ── SHARED FOLDERS ──────────────────────────────────────────
+    HEAD "SHARED FOLDERS (net share)"
+    Write-Host ""
+    try {
+        $shares = Get-SmbShare 2>$null |
+                  Where-Object { $_.Name -notmatch '^\w+\$$' }
+        foreach ($sh in $shares) {
+            Write-Host ("  {0,-20} → {1}" -f $sh.Name, $sh.Path)
+        }
+    } catch {
+        net share 2>$null
+    }
+
+    Write-Host ""
+    Write-Host "  ══════════════════════════════════════════════════" -ForegroundColor DarkGray
+    Write-Host "  Selesai: $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor DarkGray
+    WAIT
+}
+
+# ================================================================
+#  MENU UTAMA
+# ================================================================
+function Show-Menu {
+    Clear-Host
+    Write-Host ""
+    Write-Host "  ╔═══════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "  ║        SCHOOL PRINTER MANAGER             ║" -ForegroundColor Cyan
+    Write-Host "  ║        Windows 10  |  Full Support        ║" -ForegroundColor Cyan
+    Write-Host "  ╚═══════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  ── SETUP ─────────────────────────────────────" -ForegroundColor Yellow
+    Write-Host "  1. Setup SERVER  (jalankan di PC yang punya printer)"
+    Write-Host "  2. Setup CLIENT  (jalankan di PC yang mau pakai printer)"
+    Write-Host ""
+    Write-Host "  ── MANAJEMEN PRINTER ─────────────────────────" -ForegroundColor Yellow
+    Write-Host "  3. Share Printer    (cepat, server sudah siap)"
+    Write-Host "  4. Connect Printer  (cepat, client sudah siap)"
+    Write-Host "  5. List Printer"
+    Write-Host "  6. Set Default Printer"
+    Write-Host "  7. Hapus Printer"
+    Write-Host ""
+    Write-Host "  ── ALAT TEKNISI ──────────────────────────────" -ForegroundColor Yellow
+    Write-Host "  8. Diagnostik Lengkap (IP, SMB, firewall, dll)"
+    Write-Host ""
+    Write-Host "  0. Keluar"
+    Write-Host ""
+}
+
+# ================================================================
+#  LOOP UTAMA
+# ================================================================
+$running = $true
 while ($running) {
     Show-Menu
     $choice = Read-Host "  Pilih Menu"
-
     switch ($choice) {
-        "1"     { Menu-SharePrinter   }
-        "2"     { Menu-ConnectPrinter }
-        "3"     { Menu-ListPrinter    }
-        "4"     { Menu-SetDefault     }
-        "5"     { Menu-HapusPrinter   }
-        "6"     { Menu-InfoIP         }
-        "0"     { $running = $false   }
-        default { Write-Fail "Pilihan tidak valid."; Start-Sleep -Seconds 1 }
+        "1" { Setup-Server         }
+        "2" { Setup-Client         }
+        "3" { Share-Printer        }
+        "4" { Connect-Printer-Quick }
+        "5" { List-Printers        }
+        "6" { Set-Default-Printer  }
+        "7" { Remove-Printer-Menu  }
+        "8" { Run-Diagnostics      }
+        "0" { $running = $false    }
+        default {
+            FAIL "Pilihan tidak valid."
+            Start-Sleep -Milliseconds 800
+        }
     }
 }
 
