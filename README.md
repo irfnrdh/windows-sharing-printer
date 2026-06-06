@@ -1,6 +1,6 @@
 # 🖨️ Windows Sharing Printer
 
-Script PowerShell untuk manajemen printer jaringan di lingkungan sekolah — mendukung setup server, konfigurasi client, troubleshooting SMB, dan fix PrintNightmare secara otomatis.
+Script PowerShell untuk manajemen printer jaringan mendukung setup server, konfigurasi client, troubleshooting SMB, dan fix PrintNightmare secara otomatis.
 
 ---
 
