@@ -736,6 +736,218 @@ function Run-Diagnostics {
 }
 
 # ================================================================
+#  I. FIX PRINTNIGHTMARE (CVE-2021-1675 / CVE-2021-34527)
+# ================================================================
+function Fix-PrintNightmare {
+    Clear-Host
+    Write-Host ""
+    Write-Host "  ╔══════════════════════════════════════════════════╗" -ForegroundColor Red
+    Write-Host "  ║         FIX PRINTNIGHTMARE                       ║" -ForegroundColor Red
+    Write-Host "  ║  CVE-2021-1675 / CVE-2021-34527                  ║" -ForegroundColor Red
+    Write-Host "  ║  Patch Microsoft yang memblokir printer sharing   ║" -ForegroundColor Red
+    Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Jalankan di: " -NoNewline
+    Write-Host "SERVER dan CLIENT" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  Pilih mode:" -ForegroundColor Cyan
+    Write-Host "    1. CEK STATUS — lihat kondisi registry sekarang"
+    Write-Host "    2. FIX SERVER — jalankan di PC server (host printer)"
+    Write-Host "    3. FIX CLIENT — jalankan di PC client"
+    Write-Host "    4. FIX KEDUANYA — jalankan semua fix sekaligus"
+    Write-Host "    0. Kembali"
+    Write-Host ""
+    $mode = Read-Host "  Pilih"
+
+    switch ($mode) {
+        "1" { PNM-CheckStatus  }
+        "2" { PNM-FixServer    }
+        "3" { PNM-FixClient    }
+        "4" { PNM-FixServer; PNM-FixClient }
+        "0" { return }
+        default { FAIL "Pilihan tidak valid." }
+    }
+    WAIT
+}
+
+function PNM-CheckStatus {
+    HEAD "STATUS REGISTRY PRINTNIGHTMARE"
+    Write-Host ""
+
+    $checks = @(
+        @{
+            Path  = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint"
+            Name  = "RestrictDriverInstallationToAdministrators"
+            Ideal = 0
+            Label = "RestrictDriverInstall (0=bebas install driver)"
+        },
+        @{
+            Path  = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint"
+            Name  = "NoWarningNoElevationOnInstall"
+            Ideal = 1
+            Label = "NoWarningNoElevation (1=tidak minta UAC)"
+        },
+        @{
+            Path  = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint"
+            Name  = "UpdatePromptSettings"
+            Ideal = 2
+            Label = "UpdatePromptSettings (2=tidak blokir update driver)"
+        },
+        @{
+            Path  = "HKLM:\SYSTEM\CurrentControlSet\Control\Print"
+            Name  = "RpcAuthnLevelPrivacyEnabled"
+            Ideal = 0
+            Label = "RpcAuthnLevelPrivacy (0=izinkan RPC printer lama)"
+        },
+        @{
+            Path  = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Providers\LanMan Print Services\Servers"
+            Name  = "AddPrinterDrivers"
+            Ideal = 1
+            Label = "AddPrinterDrivers (1=izinkan tambah driver dari server)"
+        }
+    )
+
+    foreach ($c in $checks) {
+        $val = (Get-ItemProperty -Path $c.Path -Name $c.Name 2>$null).($c.Name)
+        Write-Host ("  {0}" -f $c.Label)
+        Write-Host "    Path  : $($c.Path)\$($c.Name)"
+        Write-Host "    Nilai : " -NoNewline
+        if ($null -eq $val) {
+            Write-Host "(tidak ada / default Windows)" -ForegroundColor DarkYellow
+        } elseif ($val -eq $c.Ideal) {
+            Write-Host "$val  ✓ Sudah benar" -ForegroundColor Green
+        } else {
+            Write-Host "$val  ✗ Perlu diubah ke $($c.Ideal)" -ForegroundColor Red
+        }
+        Write-Host ""
+    }
+
+    # Cek Windows Update terkait PrintNightmare
+    HEAD "WINDOWS UPDATE TERKAIT"
+    Write-Host ""
+    $pnmKBs = @("KB5005033","KB5005031","KB5005010","KB5004945","KB5004237",
+                 "KB5004946","KB5004244","KB5004243")
+    $installedKBs = Get-HotFix 2>$null | Select-Object -ExpandProperty HotFixID
+
+    foreach ($kb in $pnmKBs) {
+        $installed = $installedKBs -contains $kb
+        Write-Host "  $kb : " -NoNewline
+        if ($installed) {
+            Write-Host "Terinstall (patch PrintNightmare aktif)" -ForegroundColor Yellow
+        } else {
+            Write-Host "Tidak ada" -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ""
+    INFO "Patch PrintNightmare terinstall = sharing printer diperketat."
+    INFO "Fix di bawah akan longgarkan policy-nya tanpa uninstall patch."
+}
+
+function PNM-FixServer {
+    HEAD "FIX SERVER — PrintNightmare"
+    Write-Host ""
+
+    # ── 1. Point and Print Policy ──────────────────────────────
+    INFO "[1/6] Point and Print policy..."
+    $pnpPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint"
+    if (-not (Test-Path $pnpPath)) {
+        New-Item -Path $pnpPath -Force 2>$null | Out-Null
+    }
+    # Izinkan install driver tanpa UAC untuk printer yang sudah dikenal
+    Set-ItemProperty -Path $pnpPath -Name "RestrictDriverInstallationToAdministrators" -Value 0  -Type DWord -Force 2>$null
+    Set-ItemProperty -Path $pnpPath -Name "NoWarningNoElevationOnInstall"               -Value 1  -Type DWord -Force 2>$null
+    Set-ItemProperty -Path $pnpPath -Name "UpdatePromptSettings"                        -Value 2  -Type DWord -Force 2>$null
+    Set-ItemProperty -Path $pnpPath -Name "InForest"                                    -Value 0  -Type DWord -Force 2>$null
+    Set-ItemProperty -Path $pnpPath -Name "Restricted"                                  -Value 0  -Type DWord -Force 2>$null
+    OK "Point and Print policy dilonggarkan"
+
+    # ── 2. RPC Privacy — blokir koneksi printer RPC lama ───────
+    INFO "[2/6] RPC Authentication Level Privacy..."
+    $printPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Print"
+    Set-ItemProperty -Path $printPath -Name "RpcAuthnLevelPrivacyEnabled" -Value 0 -Type DWord -Force 2>$null
+    OK "RpcAuthnLevelPrivacyEnabled = 0 (izinkan RPC printer lama)"
+
+    # ── 3. Izinkan driver dari non-admin (LanMan Print Server) ──
+    INFO "[3/6] LanMan Print Services driver policy..."
+    $lanPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Providers\LanMan Print Services\Servers"
+    if (-not (Test-Path $lanPath)) { New-Item -Path $lanPath -Force 2>$null | Out-Null }
+    Set-ItemProperty -Path $lanPath -Name "AddPrinterDrivers" -Value 1 -Type DWord -Force 2>$null
+    OK "AddPrinterDrivers = 1"
+
+    # ── 4. Spooler: matikan RestrictDriverInstallation via GPO ──
+    INFO "[4/6] Group Policy — paksa disable restriction..."
+    $gpPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Providers\LanMan Print Services\Servers"
+    if (-not (Test-Path $gpPath)) { New-Item -Path $gpPath -Force 2>$null | Out-Null }
+    Set-ItemProperty -Path $gpPath -Name "AddPrinterDrivers" -Value 1 -Type DWord -Force 2>$null
+    OK "GPO print server dikonfigurasi"
+
+    # ── 5. Restart Spooler ──────────────────────────────────────
+    INFO "[5/6] Restart Print Spooler..."
+    Stop-Service Spooler -Force 2>$null
+    Start-Sleep -Seconds 2
+    Start-Service Spooler 2>$null
+    $st = (Get-Service Spooler 2>$null).Status
+    if ($st -eq 'Running') { OK "Print Spooler running kembali" }
+    else { FAIL "Spooler gagal start — cek Event Viewer" }
+
+    # ── 6. Package Point and Print ──────────────────────────────
+    INFO "[6/6] Package Point and Print restriction..."
+    $pkgPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers"
+    if (-not (Test-Path $pkgPath)) { New-Item -Path $pkgPath -Force 2>$null | Out-Null }
+    Set-ItemProperty -Path $pkgPath -Name "PackagePointAndPrintOnly"           -Value 0 -Type DWord -Force 2>$null
+    Set-ItemProperty -Path $pkgPath -Name "PackagePointAndPrintServerList"     -Value 0 -Type DWord -Force 2>$null
+    OK "Package Point and Print restriction dinonaktifkan"
+
+    Write-Host ""
+    OK "FIX SERVER selesai."
+    INFO "Jika sebelumnya ada Group Policy dari domain, fix ini mungkin"
+    INFO "tertimpa setelah gpupdate. Hubungi admin jaringan/domain jika itu terjadi."
+}
+
+function PNM-FixClient {
+    HEAD "FIX CLIENT — PrintNightmare"
+    Write-Host ""
+
+    # ── 1. Point and Print sama seperti server ──────────────────
+    INFO "[1/4] Point and Print policy di client..."
+    $pnpPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint"
+    if (-not (Test-Path $pnpPath)) { New-Item -Path $pnpPath -Force 2>$null | Out-Null }
+    Set-ItemProperty -Path $pnpPath -Name "RestrictDriverInstallationToAdministrators" -Value 0 -Type DWord -Force 2>$null
+    Set-ItemProperty -Path $pnpPath -Name "NoWarningNoElevationOnInstall"               -Value 1 -Type DWord -Force 2>$null
+    Set-ItemProperty -Path $pnpPath -Name "UpdatePromptSettings"                        -Value 2 -Type DWord -Force 2>$null
+    OK "Point and Print policy dilonggarkan"
+
+    # ── 2. RPC di client ────────────────────────────────────────
+    INFO "[2/4] RPC Authentication Level di client..."
+    $printPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Print"
+    Set-ItemProperty -Path $printPath -Name "RpcAuthnLevelPrivacyEnabled" -Value 0 -Type DWord -Force 2>$null
+    OK "RpcAuthnLevelPrivacyEnabled = 0"
+
+    # ── 3. Package Point and Print ──────────────────────────────
+    INFO "[3/4] Package Point and Print restriction..."
+    $pkgPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers"
+    if (-not (Test-Path $pkgPath)) { New-Item -Path $pkgPath -Force 2>$null | Out-Null }
+    Set-ItemProperty -Path $pkgPath -Name "PackagePointAndPrintOnly"       -Value 0 -Type DWord -Force 2>$null
+    Set-ItemProperty -Path $pkgPath -Name "PackagePointAndPrintServerList" -Value 0 -Type DWord -Force 2>$null
+    OK "Package Point and Print dinonaktifkan"
+
+    # ── 4. Restart Spooler client ────────────────────────────────
+    INFO "[4/4] Restart Print Spooler client..."
+    Stop-Service Spooler -Force 2>$null
+    Start-Sleep -Seconds 2
+    Start-Service Spooler 2>$null
+    $st = (Get-Service Spooler 2>$null).Status
+    if ($st -eq 'Running') { OK "Print Spooler running" }
+    else { FAIL "Spooler gagal — cek Event Viewer" }
+
+    Write-Host ""
+    OK "FIX CLIENT selesai."
+    INFO "Sekarang coba connect ulang ke printer server."
+    INFO "Gunakan Menu 4 (Connect Printer) atau double-click printer di File Explorer."
+}
+
+# ================================================================
 #  MENU UTAMA
 # ================================================================
 function Show-Menu {
@@ -759,6 +971,7 @@ function Show-Menu {
     Write-Host ""
     Write-Host "  ── ALAT TEKNISI ──────────────────────────────" -ForegroundColor Yellow
     Write-Host "  8. Diagnostik Lengkap (IP, SMB, firewall, dll)"
+    Write-Host "  9. Fix PrintNightmare (CVE-2021-1675/34527)  " -ForegroundColor Red
     Write-Host ""
     Write-Host "  0. Keluar"
     Write-Host ""
@@ -780,6 +993,7 @@ while ($running) {
         "6" { Set-Default-Printer  }
         "7" { Remove-Printer-Menu  }
         "8" { Run-Diagnostics      }
+        "9" { Fix-PrintNightmare   }
         "0" { $running = $false    }
         default {
             FAIL "Pilihan tidak valid."
