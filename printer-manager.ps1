@@ -1,5 +1,5 @@
 # ================================================================
-#  printer-manager.ps1  |  School Printer Manager  |  Win10 Pro
+#  printer-manager.ps1  |  Windows Sharing Printer  |  Win10 Pro
 #  Untuk teknisi — setup lengkap SMB + sharing + diagnostik
 # ================================================================
 
@@ -954,7 +954,7 @@ function Show-Menu {
     Clear-Host
     Write-Host ""
     Write-Host "  ╔═══════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "  ║        SCHOOL PRINTER MANAGER             ║" -ForegroundColor Cyan
+    Write-Host "  ║        WINDOWS SHARING PRINTER             ║" -ForegroundColor Cyan
     Write-Host "  ║        Windows 10  |  Full Support        ║" -ForegroundColor Cyan
     Write-Host "  ╚═══════════════════════════════════════════╝" -ForegroundColor Cyan
     Write-Host ""
